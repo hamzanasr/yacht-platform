@@ -12,7 +12,7 @@ Companion code for the PRD & Architecture doc. Everything here runs on Node 22+ 
 | `src/booking/availability.test.ts` | 6 tests for FIXED/OPEN slots, buffers, lead time, overnight shifts |
 | `src/payments/moyasar-webhook.ts` | Webhook + callback + reconciliation sharing one idempotent `confirmPayment` |
 | `api/openapi.yaml` | OpenAPI 3.1: 35 operations for web, mobile, owner, partner and admin |
-| `docs/guide.html` | Interactive spec guide (Arabic / English): every screen step by step, ready-made tools, price calculator, booking statuses. Open it in a browser. |
+| `docs/index.html` | Interactive spec guide (Arabic / English): every screen step by step, ready-made tools, price calculator, booking statuses. Open it in a browser. |
 
 ## Run
 
