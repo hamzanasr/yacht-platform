@@ -1,0 +1,622 @@
+openapi: 3.1.0
+info:
+  title: Yacht Charter Marketplace API
+  version: 1.0.0
+  description: |
+    One API for the responsive web app (Phase 1) and native apps (Phase 2).
+    - Money is integer **halalas** (1 SAR = 100). Rates are **basis points** (1500 = 15%).
+    - Times are ISO-8601 with offset; business timezone Asia/Riyadh (+03:00).
+    - `Accept-Language: ar | en` selects bilingual fields; Arabic is the default.
+    - Mutating checkout calls require an `Idempotency-Key` header (UUID).
+    - Errors use RFC 9457 problem+json with a stable `code`.
+servers:
+  - url: https://api.example.sa/v1
+security:
+  - bearer: []
+
+tags:
+  - { name: Auth }
+  - { name: Catalog }
+  - { name: Checkout }
+  - { name: Bookings }
+  - { name: Owner }
+  - { name: Partner }
+  - { name: Admin }
+  - { name: Webhooks }
+
+paths:
+  # ───────────────────────── Auth ─────────────────────────
+  /auth/otp:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Send a one-time code by SMS/WhatsApp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [phone], properties: { phone: { $ref: '#/components/schemas/PhoneE164' } } }
+      responses:
+        '204': { description: Code sent }
+        '429': { $ref: '#/components/responses/Problem' }
+  /auth/token:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Exchange OTP (or refresh token) for access + refresh tokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [phone, code], properties: { phone: { $ref: '#/components/schemas/PhoneE164' }, code: { type: string, pattern: '^[0-9]{6}$' } } }
+                - { type: object, required: [refreshToken], properties: { refreshToken: { type: string } } }
+      responses:
+        '200':
+          description: Tokens
+          content:
+            application/json:
+              schema: { type: object, properties: { accessToken: { type: string }, refreshToken: { type: string }, expiresIn: { type: integer, example: 900 } } }
+        '401': { $ref: '#/components/responses/Problem' }
+
+  # ───────────────────────── Catalog ─────────────────────────
+  /cities:
+    get:
+      tags: [Catalog]
+      security: []
+      summary: Live cities with their marinas
+      responses:
+        '200':
+          description: Cities
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/City' } } } }
+  /search:
+    get:
+      tags: [Catalog]
+      security: []
+      summary: Boats with at least one free slot on a date
+      parameters:
+        - { name: city, in: query, required: true, schema: { type: string, example: jeddah } }
+        - { name: marina, in: query, schema: { type: string, example: obhur-north } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: guests, in: query, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: durationMinutes, in: query, schema: { type: integer, minimum: 60 } }
+        - { name: boatType, in: query, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Results (cached 60 s per query; availability rechecked at hold time)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/SearchResult' } }
+                  nextCursor: { type: [string, 'null'] }
+  /boats/{boatId}:
+    get:
+      tags: [Catalog]
+      security: []
+      parameters: [ { $ref: '#/components/parameters/BoatId' } ]
+      responses:
+        '200': { description: Boat detail, content: { application/json: { schema: { $ref: '#/components/schemas/BoatDetail' } } } }
+        '404': { $ref: '#/components/responses/Problem' }
+  /boats/{boatId}/availability:
+    get:
+      tags: [Catalog]
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/BoatId' }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: destinationId, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: durationMinutes, in: query, description: OPEN mode only, schema: { type: integer } }
+      responses:
+        '200':
+          description: Bookable slots (buffer already applied)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slotMode: { $ref: '#/components/schemas/SlotMode' }
+                  dayType: { $ref: '#/components/schemas/DayType' }
+                  slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+  /quotes:
+    post:
+      tags: [Checkout]
+      security: []
+      summary: Price a trip without holding it
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/TripSelection' } } } }
+      responses:
+        '200': { description: Breakdown, content: { application/json: { schema: { $ref: '#/components/schemas/QuoteBreakdown' } } } }
+        '422': { $ref: '#/components/responses/Problem' }
+
+  # ───────────────────────── Checkout ─────────────────────────
+  /checkout/intents:
+    post:
+      tags: [Checkout]
+      summary: Hold the slot for 10 minutes and create a PENDING_PAYMENT booking
+      description: |
+        1. Re-prices server-side (client prices are ignored).
+        2. Redis `SET hold:{boat}:{start}:{end} <token> NX EX 600`, then Postgres `fn_hold_slot` (exclusion-constrained).
+        3. Returns the Moyasar form config. `metadata.booking_id` is required for confirmation.
+        If `amountDueOnline` is 0 (fully covered by a reschedule pass) the booking goes straight to PENDING_MANIFEST.
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/TripSelection'
+                - type: object
+                  properties:
+                    reschedulePassCode: { type: string }
+      responses:
+        '201':
+          description: Held
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bookingId: { type: string, format: uuid }
+                  bookingNumber: { type: string, example: JED-261016-7K3Q }
+                  holdExpiresAt: { type: string, format: date-time }
+                  quote: { $ref: '#/components/schemas/QuoteBreakdown' }
+                  payment:
+                    type: [object, 'null']
+                    properties:
+                      provider: { const: MOYASAR }
+                      publishableKey: { type: string }
+                      amount: { type: integer, description: halalas }
+                      currency: { const: SAR }
+                      description: { type: string }
+                      methods: { type: array, items: { enum: [creditcard, applepay, stcpay] } }
+                      supportedNetworks: { type: array, items: { enum: [mada, visa, mastercard] } }
+                      callbackUrl: { type: string, format: uri }
+                      metadata: { type: object, properties: { booking_id: { type: string } } }
+        '409': { description: SLOT_HELD or SLOT_UNAVAILABLE, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        '422': { $ref: '#/components/responses/Problem' }
+  /checkout/intents/{bookingId}:
+    delete:
+      tags: [Checkout]
+      summary: Release the hold (client changed slot or left)
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      responses: { '204': { description: Released } }
+  /checkout/intents/{bookingId}/payment:
+    post:
+      tags: [Checkout]
+      summary: Register the Moyasar payment id (form on_completed / redirect callback)
+      description: Server fetches the payment from Moyasar and confirms idempotently — same path as the webhook.
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [paymentId], properties: { paymentId: { type: string } } } } }
+      responses:
+        '200':
+          description: Current state
+          content: { application/json: { schema: { type: object, properties: { outcome: { enum: [PAID, ALREADY_PAID, FAILED, REFUNDED_SLOT_LOST, PENDING] }, booking: { $ref: '#/components/schemas/Booking' } } } } }
+
+  /webhooks/moyasar:
+    post:
+      tags: [Webhooks]
+      security: []
+      summary: Moyasar event receiver
+      description: Authenticated by `secret_token` (constant-time compare); payment re-fetched from Moyasar; idempotent on event id. Returns 500 to request a retry.
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses: { '200': { description: Accepted }, '401': { description: Bad secret }, '500': { description: Retry } }
+
+  # ───────────────────────── Bookings (client) ─────────────────────────
+  /bookings:
+    get:
+      tags: [Bookings]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/BookingStatus' } }
+      responses:
+        '200': { description: My bookings, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Booking' } } } } }
+  /bookings/{bookingId}:
+    get:
+      tags: [Bookings]
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      responses:
+        '200': { description: Booking, content: { application/json: { schema: { $ref: '#/components/schemas/Booking' } } } }
+  /bookings/{bookingId}/manifest:
+    put:
+      tags: [Bookings]
+      summary: Submit / replace the full Coast Guard passenger manifest
+      description: |
+        Exactly `guests` passengers, one lead passenger. ID numbers are validated by type
+        (National ID: 10 digits starting 1; Iqama: 10 digits starting 2; Passport: 6–9 alphanumerics),
+        encrypted (AES-256-GCM) and stored with an HMAC blind index. On success the voucher is issued
+        and the client/captain WhatsApp messages are queued. Locked 2 h before departure.
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [passengers]
+              properties:
+                passengers: { type: array, minItems: 1, items: { $ref: '#/components/schemas/PassengerInput' } }
+      responses:
+        '200': { description: Voucher issued, content: { application/json: { schema: { $ref: '#/components/schemas/Booking' } } } }
+        '409': { description: MANIFEST_LOCKED or booking not paid }
+        '422': { $ref: '#/components/responses/Problem' }
+  /bookings/{bookingId}/voucher:
+    get:
+      tags: [Bookings]
+      parameters: [ { $ref: '#/components/parameters/BookingId' }, { name: format, in: query, schema: { enum: [json, pdf], default: json } } ]
+      responses:
+        '200': { description: Voucher (QR encodes a signed booking token for dock check-in) }
+        '409': { description: Manifest not complete }
+  /bookings/{bookingId}/cancel:
+    post:
+      tags: [Bookings]
+      summary: Client cancellation — deposit is non-refundable
+      description: "Requires `acknowledgeNonRefundable = true`. The slot is released immediately."
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [acknowledgeNonRefundable], properties: { acknowledgeNonRefundable: { const: true }, reason: { type: string } } } } } }
+      responses: { '200': { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/Booking' } } } } }
+  /reschedule-passes:
+    get:
+      tags: [Bookings]
+      summary: My active Emergency Reschedule Passes
+      responses: { '200': { description: Passes, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ReschedulePass' } } } } } }
+
+  # ───────────────────────── Owner portal ─────────────────────────
+  /owner/bookings:
+    get:
+      tags: [Owner]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses: { '200': { description: Owner's bookings incl. balance to collect, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Booking' } } } } } }
+  /owner/bookings/{bookingId}/manifest:
+    get:
+      tags: [Owner]
+      summary: Decrypted manifest for the captain (audited; also reachable via signed WhatsApp link)
+      parameters: [ { $ref: '#/components/parameters/BookingId' }, { name: t, in: query, description: signed link token, schema: { type: string } } ]
+      responses: { '200': { description: Manifest, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PassengerView' } } } } } }
+  /owner/bookings/{bookingId}/status:
+    post:
+      tags: [Owner]
+      summary: Captain marks the trip
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { enum: [BALANCE_COLLECTED, COMPLETED, NO_SHOW, OWNER_CANCEL] }
+                note: { type: string }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Booking' } } } } }
+  /owner/boats/{boatId}/blocks:
+    post:
+      tags: [Owner]
+      summary: Block time for maintenance or private use
+      parameters: [ { $ref: '#/components/parameters/BoatId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [start, end, kind], properties: { start: { type: string, format: date-time }, end: { type: string, format: date-time }, kind: { enum: [MAINTENANCE, OWNER_BLOCK] }, note: { type: string } } }
+      responses: { '201': { description: Blocked }, '409': { description: Overlaps an existing booking } }
+
+  # ───────────────────────── Partner portal ─────────────────────────
+  /r/{code}:
+    get:
+      tags: [Partner]
+      security: []
+      summary: Referral redirect — records a click and sets a first-party attribution cookie
+      parameters: [ { name: code, in: path, required: true, schema: { type: string } } ]
+      responses: { '302': { description: Redirect to landing page } }
+  /partner/me:
+    get:
+      tags: [Partner]
+      responses: { '200': { description: Profile, terms and wallet, content: { application/json: { schema: { $ref: '#/components/schemas/PartnerSummary' } } } } }
+  /partner/stats:
+    get:
+      tags: [Partner]
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: granularity, in: query, schema: { enum: [day, week, month], default: day } }
+      responses:
+        '200':
+          description: Clicks, bookings, conversion rate, GMV and earnings per period
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    period: { type: string }
+                    clicks: { type: integer }
+                    bookings: { type: integer }
+                    conversionRate: { type: number }
+                    gmvHalalas: { type: integer }
+                    earningsHalalas: { type: integer }
+  /partner/transactions:
+    get:
+      tags: [Partner]
+      responses: { '200': { description: Ledger lines, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AffiliateTxn' } } } } } }
+  /partner/payout-requests:
+    post:
+      tags: [Partner]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [amountHalalas], properties: { amountHalalas: { type: integer, minimum: 10000 } } } } } }
+      responses: { '201': { description: Requested }, '422': { description: Exceeds available balance } }
+
+  # ───────────────────────── Admin ─────────────────────────
+  /admin/{resource}:
+    parameters:
+      - name: resource
+        in: path
+        required: true
+        schema: { enum: [owners, captains, boats, marinas, cities, destinations, addons, schedules, calendar, affiliates] }
+    get:
+      tags: [Admin]
+      summary: List (filter, sort, cursor pagination)
+      responses: { '200': { description: Page of records } }
+    post:
+      tags: [Admin]
+      summary: Create
+      responses: { '201': { description: Created }, '422': { $ref: '#/components/responses/Problem' } }
+  /admin/{resource}/{id}:
+    parameters:
+      - { name: resource, in: path, required: true, schema: { type: string } }
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get: { tags: [Admin], responses: { '200': { description: Record } } }
+    patch:
+      tags: [Admin]
+      summary: Partial update (If-Match ETag for optimistic locking; every change audited)
+      responses: { '200': { description: Updated }, '412': { description: Stale ETag } }
+    delete: { tags: [Admin], summary: Soft-delete / deactivate, responses: { '204': { description: Deactivated } } }
+  /admin/owners/{id}/commission:
+    put:
+      tags: [Admin]
+      summary: Set an owner's default commission (applies to new bookings only)
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [commissionBps], properties: { commissionBps: { type: integer, minimum: 0, maximum: 10000, example: 1500 } } } } } }
+      responses: { '200': { description: Updated } }
+  /admin/suspensions:
+    post:
+      tags: [Admin]
+      summary: Declare a Coast Guard / weather suspension — issues reschedule passes automatically
+      description: |
+        Every PAID booking (PENDING_MANIFEST or CONFIRMED) whose trip overlaps the window at the
+        affected marinas becomes EMERGENCY_RESCHEDULED, its reservation is released, a pass worth
+        the deposit (valid 90 days) is created, and client + captain are notified.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason, start, end]
+              properties:
+                reason: { enum: [COAST_GUARD, WEATHER, OTHER_AUTHORITY] }
+                cityId: { type: string, format: uuid }
+                marinaIds: { type: array, items: { type: string, format: uuid } }
+                start: { type: string, format: date-time }
+                end: { type: string, format: date-time }
+                authorityReference: { type: string }
+                dryRun: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Affected bookings (dry run) or passes issued
+          content: { application/json: { schema: { type: object, properties: { affected: { type: integer }, passesIssued: { type: integer }, bookingNumbers: { type: array, items: { type: string } } } } } }
+  /admin/bookings/{bookingId}/refund:
+    post:
+      tags: [Admin]
+      summary: Refund a deposit (owner cancellation, dispute) — ops role, audited
+      parameters: [ { $ref: '#/components/parameters/BookingId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [amountHalalas, reason], properties: { amountHalalas: { type: integer }, reason: { type: string } } } } } }
+      responses: { '200': { description: Refund requested } }
+  /admin/reports/revenue:
+    get:
+      tags: [Admin]
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: groupBy, in: query, schema: { enum: [day, owner, marina, affiliate] } }
+      responses: { '200': { description: Gross commission, discounts, partner earnings, platform net } }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    BoatId: { name: boatId, in: path, required: true, schema: { type: string, format: uuid } }
+    BookingId: { name: bookingId, in: path, required: true, schema: { type: string, format: uuid } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Problem:
+      description: Error
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, examples: [SLOT_HELD, SLOT_UNAVAILABLE, OVER_CAPACITY, BELOW_GATEWAY_MINIMUM, MANIFEST_LOCKED, PASS_EXPIRED] }
+        detail: { type: string }
+        messageAr: { type: string }
+    PhoneE164: { type: string, pattern: '^\+[1-9][0-9]{7,14}$', example: '+966512345678' }
+    DayType: { enum: [WEEKDAY, WEEKEND, HOLIDAY] }
+    SlotMode: { enum: [FIXED, OPEN] }
+    IdType: { enum: [NATIONAL_ID, IQAMA, PASSPORT] }
+    BookingStatus: { enum: [PENDING_PAYMENT, PENDING_MANIFEST, CONFIRMED, EMERGENCY_RESCHEDULED, CANCELLED_BY_CLIENT, CANCELLED_BY_OWNER, NO_SHOW, COMPLETED, EXPIRED] }
+    Localized: { type: object, properties: { ar: { type: string }, en: { type: string } } }
+    City:
+      type: object
+      properties:
+        slug: { type: string }
+        name: { $ref: '#/components/schemas/Localized' }
+        marinas:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              slug: { type: string }
+              name: { $ref: '#/components/schemas/Localized' }
+              latitude: { type: number }
+              longitude: { type: number }
+    SearchResult:
+      type: object
+      properties:
+        boatId: { type: string, format: uuid }
+        name: { $ref: '#/components/schemas/Localized' }
+        marina: { $ref: '#/components/schemas/Localized' }
+        coverImage: { type: string, format: uri }
+        maxCapacity: { type: integer }
+        fromPriceHalalas: { type: integer, description: Cheapest destination for the date's day type }
+        dayType: { $ref: '#/components/schemas/DayType' }
+        freeSlots: { type: integer }
+    BoatDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { $ref: '#/components/schemas/Localized' }
+        boatType: { type: string }
+        lengthM: { type: number }
+        baseCapacity: { type: integer }
+        maxCapacity: { type: integer }
+        slotMode: { $ref: '#/components/schemas/SlotMode' }
+        media: { type: array, items: { type: string, format: uri } }
+        destinations:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { $ref: '#/components/schemas/Localized' }
+              durationMinutes: { type: integer }
+              weekdayPriceHalalas: { type: integer }
+              weekendPriceHalalas: { type: integer }
+              holidayPriceHalalas: { type: integer }
+              baseCapacity: { type: integer }
+              extraPersonFeeHalalas: { type: integer }
+        addons:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { $ref: '#/components/schemas/Localized' }
+              priceHalalas: { type: integer }
+              collection: { enum: [ONLINE_DEPOSIT, AT_DOCK] }
+              maxQuantity: { type: integer }
+    Slot:
+      type: object
+      properties:
+        scheduleId: { type: string }
+        label: { $ref: '#/components/schemas/Localized' }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+    TripSelection:
+      type: object
+      required: [boatId, destinationId, start, end, guests]
+      properties:
+        boatId: { type: string, format: uuid }
+        destinationId: { type: string, format: uuid }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        guests: { type: integer, minimum: 1 }
+        addons: { type: array, items: { type: object, required: [addonId, quantity], properties: { addonId: { type: string, format: uuid }, quantity: { type: integer, minimum: 1 } } } }
+        referralCode: { type: string, description: Falls back to the attribution cookie }
+    QuoteBreakdown:
+      type: object
+      description: Output of pricing-engine.ts (all halalas)
+      properties:
+        dayType: { $ref: '#/components/schemas/DayType' }
+        dayTypeLabel: { type: string }
+        dayRateHalalas: { type: integer }
+        extraGuests: { type: integer }
+        extraGuestFeeHalalas: { type: integer }
+        tripSubtotalHalalas: { type: integer }
+        onlineAddonsHalalas: { type: integer }
+        dockAddonsHalalas: { type: integer }
+        totalListPriceHalalas: { type: integer }
+        clientDiscountHalalas: { type: integer }
+        depositHalalas: { type: integer }
+        rescheduleCreditAppliedHalalas: { type: integer }
+        amountDueOnlineNowHalalas: { type: integer }
+        balanceDueToCaptainHalalas: { type: integer }
+        clientTotalHalalas: { type: integer }
+    Booking:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        bookingNumber: { type: string }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        paymentStatus: { enum: [INITIATED, PAID, FAILED, REFUNDED, PARTIALLY_REFUNDED, VOIDED, NOT_REQUIRED] }
+        boat: { $ref: '#/components/schemas/Localized' }
+        marina:
+          type: object
+          properties: { name: { $ref: '#/components/schemas/Localized' }, latitude: { type: number }, longitude: { type: number } }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        guests: { type: integer }
+        depositHalalas: { type: integer }
+        balanceDueToCaptainHalalas: { type: integer }
+        manifestComplete: { type: boolean }
+        voucherUrl: { type: [string, 'null'], format: uri }
+        holdExpiresAt: { type: [string, 'null'], format: date-time }
+    PassengerInput:
+      type: object
+      required: [fullName, idType, idNumber]
+      properties:
+        fullName: { type: string, minLength: 3 }
+        idType: { $ref: '#/components/schemas/IdType' }
+        idNumber: { type: string, writeOnly: true }
+        nationality: { type: string, pattern: '^[A-Z]{2}$' }
+        phone: { $ref: '#/components/schemas/PhoneE164' }
+        isLead: { type: boolean }
+    PassengerView:
+      type: object
+      properties:
+        seq: { type: integer }
+        fullName: { type: string }
+        idType: { $ref: '#/components/schemas/IdType' }
+        idNumber: { type: string, description: Full number only on the owner manifest endpoint; elsewhere masked (•••••1234) }
+        nationality: { type: string }
+        phone: { type: string }
+    ReschedulePass:
+      type: object
+      properties:
+        code: { type: string }
+        creditHalalas: { type: integer }
+        reason: { enum: [SUSPENSION, OWNER_CANCELLATION, ADMIN_GOODWILL] }
+        expiresAt: { type: string, format: date-time }
+        status: { enum: [ACTIVE, REDEEMED, EXPIRED, VOID] }
+        originalBookingNumber: { type: string }
+    PartnerSummary:
+      type: object
+      properties:
+        displayName: { type: string }
+        partnerType: { enum: [INFLUENCER, TRAVEL_AGENCY, CORPORATE] }
+        referralCode: { type: string }
+        referralLink: { type: string, format: uri }
+        clientDiscountBps: { type: integer }
+        partnerCommissionBps: { type: integer }
+        pendingHalalas: { type: integer }
+        availableHalalas: { type: integer }
+        lifetimeEarnedHalalas: { type: integer }
+    AffiliateTxn:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { enum: [EARNING, REVERSAL, PAYOUT, ADJUSTMENT] }
+        status: { enum: [PENDING, AVAILABLE, PAID, VOID] }
+        amountHalalas: { type: integer }
+        bookingNumber: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
